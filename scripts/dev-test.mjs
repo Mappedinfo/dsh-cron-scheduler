@@ -136,5 +136,94 @@ check('重叠运行被跳过', secondManifest.status === 'skipped', secondManife
 const firstManifest = JSON.parse(await readFile(join(paths.runs, `${firstRun}.json`), 'utf8'))
 check('首运行完成', firstManifest.status === 'succeeded', firstManifest.status)
 
+// ---- service.create：真实 workspaceRegistry 签名回归（create 接收字符串 path） ----
+console.log('== service.create ==')
+const { CronSchedulerService } = await import('../lib/test-entry.js')
+const fakeHome = join(base, 'fake-dsh-home')
+const savedDshHome = process.env.DSH_HOME
+process.env.DSH_HOME = fakeHome
+const svcCtx = {
+  workspaceRegistry: {
+    resolveByPath: async () => undefined,
+    create: async (pathArg) => ({ id: 'ws-real', title: 'Coding', path: pathArg }),
+  },
+}
+const svc = new CronSchedulerService(svcCtx, { dshCommand: fakeDsh, profile: 'headless', pollSeconds: 10, historyLimit: 50 })
+let createdId = ''
+try {
+  const def = await svc.create({ name: '回归测试', prompt: '只回复 OK', cron: '0 9 * * *', cwd: workspace, permission: 'read-only' })
+  createdId = def.id
+  check('service.create 成功（字符串 path 签名）', createdId.startsWith('task-'), createdId)
+  const list = await svc.definitions.list()
+  check('定义已落盘', list.some(d => d.id === createdId))
+  const wrapperText2 = await readFile(join(svc.paths.wrappers, `${createdId}.sh`), 'utf8')
+  check('wrapper 已生成且含 dsh 命令', wrapperText2.includes(`DSH='${fakeDsh}'`), wrapperText2.split('\n').find(l => l.startsWith('DSH=')))
+} catch (error) {
+  check('service.create 无异常', false, String(error))
+} finally {
+  if (createdId !== '') await svc.delete(createdId).catch(() => undefined)
+  await svc.dispose()
+  if (savedDshHome === undefined) delete process.env.DSH_HOME
+  else process.env.DSH_HOME = savedDshHome
+}
+check('crontab 已还原为空', (await new Promise(resolve => {
+  execFile('crontab', ['-l'], (err, stdout) => resolve(err === null && stdout.trim() === ''))
+})))
+
+
+
+// ---- spawnWrapper：只等 runId 返回，不杀长任务 ----
+console.log('== spawnWrapper ==')
+const { spawnWrapper } = await import('../lib/test-entry.js')
+await writeFile(fakeDsh, '#!/bin/bash\nsleep 3\nexit 0\n', { mode: 0o755 })
+await chmod(fakeDsh, 0o755)
+const defSw = { ...definition, id: 'task-sw' }
+await generateWrapperFiles([defSw], { paths, dshHome: join(base, '.dsh'), dshCommand: fakeDsh, profile: 'headless' })
+const swStart = Date.now()
+const swResult = await spawnWrapper(paths, 'task-sw', 'manual')
+const swElapsed = Date.now() - swStart
+check('spawnWrapper 快速返回 runId（<2s）', swResult.runId !== null && /^task-sw-\d{8}-\d{6}-\d+$/.test(swResult.runId ?? '') && swElapsed < 2000, JSON.stringify(swResult) + ` ${swElapsed}ms`)
+const swManifest1 = JSON.parse(await readFile(join(paths.runs, `${swResult.runId}.json`), 'utf8'))
+check('返回时子进程仍在运行', swManifest1.status === 'running' || swManifest1.status === 'queued', swManifest1.status)
+await new Promise(r => setTimeout(r, 3500))
+const swManifest2 = JSON.parse(await readFile(join(paths.runs, `${swResult.runId}.json`), 'utf8'))
+check('子进程完成后终态写入', swManifest2.status === 'succeeded', swManifest2.status)
+
+
+// ---- dsh 命令自动解析 ----// ---- dsh 命令自动解析 ----
+console.log('== dsh resolve ==')
+const { deriveCliEntryFromArgv, ensureDshShim, resolveDshCommand } = await import('../lib/test-entry.js')
+const checkout = '/Users/shiqi/Coding/github/deepseek-ai/deepseek-harness'
+const entryFromSrc = deriveCliEntryFromArgv(['node', 'apps/cli/src/bin.ts', 'web'], checkout)
+check('dev 模式 argv 推导 lib/bin.js', entryFromSrc === `${checkout}/apps/cli/lib/bin.js`, entryFromSrc)
+const entryFromLib = deriveCliEntryFromArgv(['node', `${checkout}/apps/cli/lib/bin.js`], '/')
+check('lib/bin.js 直接命中', entryFromLib === `${checkout}/apps/cli/lib/bin.js`, entryFromLib)
+check('无关 argv 返回 undefined', deriveCliEntryFromArgv(['node', 'server.js'], '/') === undefined)
+
+const shimBase = join(base, 'shim-home')
+const shimPaths = { base: shimBase, definitions: 'd', wrappers: 'w', logs: 'l', runs: 'r', locks: 'k', tasks: 't' }
+const shimPath = ensureDshShim(shimPaths, '/opt/homebrew/bin/node', entryFromSrc)
+const shimText = await readFile(shimPath, 'utf8')
+check('shim 内容正确', shimText.includes("exec '/opt/homebrew/bin/node'") && shimText.includes(entryFromSrc), shimText.trim())
+
+// 模拟：PATH 无 dsh、argv 指向 dev 入口 → 自动 shim
+const savedArgv = process.argv
+const savedPath = process.env.PATH
+const savedBin = process.env.DSH_BIN
+process.argv = ['node', `${checkout}/apps/cli/src/bin.ts`, 'web']
+process.env.PATH = '/nonexistent'
+delete process.env.DSH_BIN
+const auto = resolveDshCommand(undefined, shimPaths)
+check('argv 推导自动 shim', auto.source === 'auto-shim', JSON.stringify(auto))
+check('auto-shim 指向 shim 文件', auto.command === shimPath, auto.command)
+// 显式配置优先
+const cfg = resolveDshCommand('/custom/dsh', shimPaths)
+check('config 优先', cfg.source === 'config' && cfg.command === '/custom/dsh', JSON.stringify(cfg))
+process.argv = savedArgv
+process.env.PATH = savedPath
+if (savedBin === undefined) delete process.env.DSH_BIN
+else process.env.DSH_BIN = savedBin
+
+
 console.log(failures === 0 ? '\n全部通过' : `\n${failures} 项失败`)
 process.exit(failures === 0 ? 0 : 1)

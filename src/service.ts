@@ -4,6 +4,7 @@ import { randomUUID } from 'node:crypto'
 import type { Context } from '@deepseek-ai/cordis'
 import { validateCron, nextCronRun, normalizeCron } from './cron.ts'
 import { syncDeployments, spawnWrapper } from './deploy.ts'
+import { resolveDshCommand } from './dsh-resolve.ts'
 import { pluginBaseDir, pluginPaths, resolveDshHome, type PluginPaths } from './home.ts'
 import { DefinitionStore, RunStore } from './storage.ts'
 import type {
@@ -56,8 +57,53 @@ export class CronSchedulerService {
   async start(): Promise<void> {
     await this.definitions.ensure()
     await this.runs.ensure()
+    await this.recoverInterruptedRuns()
+    await this.cleanStaleLocks()
     const loaded = await this.definitions.list()
     await this.redeployAll(loaded)
+  }
+
+  /** wrapper 被中断（进程被杀/崩溃）会留下永远 running 的记录；启动时收尾为 failed。 */
+  private async recoverInterruptedRuns(): Promise<void> {
+    const staleMs = 60 * 60 * 1000
+    const now = Date.now()
+    for (const run of await this.runs.list()) {
+      if (run.status !== 'running' && run.status !== 'queued') continue
+      const started = Date.parse(run.startedAt ?? run.scheduledFor)
+      if (Number.isNaN(started) || now - started < staleMs) continue
+      const finishedAt = new Date().toISOString()
+      await this.runs.update(run.id, current => ({
+        ...current,
+        status: 'failed',
+        finishedAt,
+        error: current.error ?? 'host_interrupted：wrapper 运行被中断，未写入终态',
+        unread: true,
+      }))
+    }
+  }
+
+  /** 清理陈旧锁（wrapper 被 SIGKILL 时 EXIT trap 不会执行）。 */
+  private async cleanStaleLocks(): Promise<void> {
+    const staleMs = 24 * 60 * 60 * 1000
+    const { readdir, stat, rm } = await import('node:fs/promises')
+    const { join } = await import('node:path')
+    let entries: string[]
+    try {
+      entries = await readdir(this.paths.locks)
+    } catch {
+      return
+    }
+    const now = Date.now()
+    for (const entry of entries) {
+      try {
+        const info = await stat(join(this.paths.locks, entry))
+        if (now - info.mtimeMs > staleMs) {
+          await rm(join(this.paths.locks, entry), { recursive: true, force: true })
+        }
+      } catch {
+        // 单个锁清理失败不阻塞启动
+      }
+    }
   }
 
   private serialize<T>(operation: () => Promise<T>): Promise<T> {
@@ -189,7 +235,7 @@ export class CronSchedulerService {
     const definitions = await this.definitions.list()
     const runs = await this.runs.list()
     const runById = new Map(runs.map(run => [run.automationId, run]))
-    const dsh = resolveDshInfo(this.config.dshCommand)
+    const dsh = resolveDshInfo(this.config.dshCommand, this.paths)
     const views: DefinitionView[] = definitions.map(definition => {
       const latest = runById.get(definition.id)
       const nextRunAt = definition.status === 'active' ? nextCronRun(definition.cron) : null
@@ -237,7 +283,7 @@ export class CronSchedulerService {
     if (path === '') throw new Error('请输入工作区目录')
     const registry = this.ctx.workspaceRegistry as {
       resolveByPath?: (path: string) => Promise<unknown> | unknown
-      create?: (input: { path: string }) => Promise<unknown> | unknown
+      create?: (path: string, title?: string) => Promise<unknown> | unknown
     }
     const resolved = typeof registry.resolveByPath === 'function'
       ? await registry.resolveByPath(path)
@@ -250,7 +296,7 @@ export class CronSchedulerService {
       }
     }
     if (typeof registry.create === 'function') {
-      const created = await registry.create({ path })
+      const created = await registry.create(path)
       if (created !== undefined && created !== null) {
         return {
           id: String((created as any).id ?? ''),
@@ -292,14 +338,9 @@ function requireNonBlank(value: string, field: string): string {
   return trimmed
 }
 
-function resolveDshInfo(explicit?: string): { readonly command: string; readonly source: string } {
-  const configured = typeof explicit === 'string' && explicit.trim() !== ''
-    ? explicit.trim()
-    : undefined
-  if (configured !== undefined) return { command: configured, source: 'config' }
-  const env = process.env.DSH_BIN
-  if (typeof env === 'string' && env.trim() !== '') return { command: env.trim(), source: 'env' }
-  return { command: 'dsh', source: 'fallback' }
+function resolveDshInfo(explicit: string | undefined, paths: PluginPaths): { readonly command: string; readonly source: string } {
+  const resolution = resolveDshCommand(explicit, paths)
+  return { command: resolution.command, source: resolution.source }
 }
 
 export { normalizeCron }

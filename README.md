@@ -44,21 +44,27 @@ crontab 中插件管理的条目位于明确的标记块内：
 # <<< dsh-cron-scheduler managed block <<<
 ```
 
-## 安装
+## 安装（一条命令，零配置）
 
+**方式 A：npm 发布版**（发布后）
 ```sh
-# 0) 先构建
-cd dsh-cron-scheduler && pnpm install && pnpm check
-
-# 1) 装进 web profile（dsh 命令按你的安装方式）
-dsh plugin --profile web add ~/Coding/github/mappedinfo/dsh-cron-scheduler
-# 或（源码 checkout 里的方式）：
-node /path/to/deepseek-harness/apps/cli/lib/bin.js plugin --profile web add /path/to/dsh-cron-scheduler
-
-# 2) 重启 DSH Web 并硬刷新浏览器
+dsh plugin --profile web add @mappedinfo/dsh-cron-scheduler
 ```
 
-重启后：**设置 → 定时任务** 出现管理页；侧边栏工作区树会自动出现每次运行的会话。
+**方式 B：Git 仓库直装**（无需发布）
+```sh
+dsh plugin --profile web add github:Mappedinfo/dsh-cron-scheduler
+```
+
+**方式 C：本地源码 + 一键脚本**
+```sh
+git clone https://github.com/Mappedinfo/dsh-cron-scheduler.git
+cd dsh-cron-scheduler && ./scripts/install.sh        # 构建 + 安装 + 提示，默认 web profile
+```
+
+装完**重启 DSH Web 并硬刷新浏览器**即可，无需任何手工配置：设置 → 定时任务 出现管理页，侧边栏工作区树自动出现每次运行的会话。
+
+> `dsh plugin add` 会自动把插件的 bundle 层（cordis.patch.yml）和客户端模块（`dsh.client` → `lib/client.js`）注册进 profile，这是 DSH 的官方插件安装通道。
 
 ## 使用
 
@@ -77,26 +83,26 @@ node /path/to/deepseek-harness/apps/cli/lib/bin.js plugin --profile web add /pat
 
 时区以**系统时区**解释（cron 行为）；不支持秒级精度。
 
-## 配置（cordis.patch.yml 覆盖）
+## 配置（一般不需要动）
 
 | 配置 | 默认 | 说明 |
 |---|---|---|
 | `profile` | `headless` | wrapper 使用的 headless profile 名 |
 | `pollSeconds` | `10` | 会话监听器轮询间隔 |
 | `historyLimit` | `100` | 每规则保留的运行记录数 |
-| `dshCommand` | 自动探测 | 显式指定 wrapper 里的 dsh 命令绝对路径（自动探测失败时设置，见下） |
+| `dshCommand` | 自动解析 | 显式覆盖 wrapper 用的 dsh 命令（极少需要） |
 
-### dsh 命令路径（重要）
+### dsh 命令自动解析（零配置）
 
-wrapper 在 cron 环境下执行，PATH 极简。插件生成 wrapper 时会自动探测 `dsh`（`DSH_BIN` 环境变量 → `command -v dsh`）。若探测不到（例如你用 `pnpm dsh web` 启动、`dsh` 不在 PATH），请在 profile 的 `cordis.patch.yml` 里显式指定：
+wrapper 在 cron 环境下执行、PATH 极简，所以插件在生成 wrapper 时会在 **dsh web 进程内**按链自动解析 dsh：
 
-```yaml
-- id: cron-scheduler
-  config:
-    dshCommand: /Users/you/deepseek-harness/apps/cli/lib/bin.js
-```
+1. `config.dshCommand`（显式覆盖）
+2. `$DSH_BIN` 环境变量
+3. `command -v dsh`（PATH 全局安装）
+4. **从当前进程推导 + 自动生成 shim**：读取 `process.argv[1]`（`lib/bin.js` 或 dev 模式的 `src/bin.ts`），在 `~/.dsh/cron-scheduler/bin/dsh` 生成 `exec <node> <cli入口> "$@"` shim——覆盖 `pnpm dsh web`、源码 checkout、npm 全局安装等常见方式
+5. 兜底 `dsh` + 设置页告警
 
-设置页顶部会显示当前解析到的 dsh 命令与来源（config / DSH_BIN / PATH / 默认 dsh）。`@reboot` 任务在下次登录时执行。
+设置页顶部会显示解析到的命令与来源（config / DSH_BIN / PATH / 自动 shim / 兜底）。`@reboot` 任务在下次登录时执行。
 
 ## 权限与安全
 

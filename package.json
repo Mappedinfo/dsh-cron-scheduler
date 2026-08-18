@@ -42,7 +42,8 @@
     "build": "node scripts/build.mjs",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "test": "node scripts/dev-test.mjs",
-    "check": "pnpm typecheck && pnpm build && pnpm test"
+    "check": "pnpm typecheck && pnpm build && pnpm test",
+    "prepare": "node scripts/build.mjs"
   },
   "dependencies": {
     "cron-parser": "^5.1.0"

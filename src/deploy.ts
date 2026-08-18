@@ -3,15 +3,13 @@
  * wrapper 由 cron 在进程外调用，负责 headless 运行与运行记录 manifest。
  */
 
-import { execFile } from 'node:child_process'
-import { chmod, mkdir, rm, writeFile } from 'node:fs/promises'
+import { spawn } from 'node:child_process'
+import { chmod, mkdir, readdir, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
-import { promisify } from 'node:util'
+import { resolveDshCommand, type DshResolution } from './dsh-resolve.ts'
 import type { CronDefinition } from './types.ts'
 import { normalizeCron } from './cron.ts'
 import type { PluginPaths } from './home.ts'
-
-const execFileAsync = promisify(execFile)
 
 export const CRONTAB_MARKER_START = '# >>> dsh-cron-scheduler managed block >>>'
 export const CRONTAB_MARKER_END = '# <<< dsh-cron-scheduler managed block <<<'
@@ -34,27 +32,9 @@ function shQuote(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`
 }
 
-function resolveDshCommand(explicit?: string): { readonly command: string; readonly source: 'config' | 'env' | 'path' | 'fallback' } {
-  if (typeof explicit === 'string' && explicit.trim() !== '') {
-    return { command: explicit.trim(), source: 'config' }
-  }
-  const env = process.env.DSH_BIN
-  if (typeof env === 'string' && env.trim() !== '') {
-    return { command: env.trim(), source: 'env' }
-  }
-  try {
-    const { stdout } = execFileSyncSafe('sh', ['-lc', 'command -v dsh'])
-    const found = stdout.trim()
-    if (found !== '') return { command: found, source: 'path' }
-  } catch {
-    // 继续
-  }
-  return { command: 'dsh', source: 'fallback' }
-}
-
-function execFileSyncSafe(file: string, args: readonly string[]): { readonly stdout: string } {
-  const result = require('node:child_process').execFileSync(file, args, { encoding: 'utf8' })
-  return { stdout: String(result) }
+/** 解析 wrapper 将使用的 dsh 命令（含自动生成 shim）。 */
+export function resolveDshForDeploy(opts: DeployOptions): DshResolution {
+  return resolveDshCommand(opts.dshCommand, opts.paths)
 }
 
 /**
@@ -123,10 +103,31 @@ export function wrapperScript(
   ].join('\n')
 }
 
+interface CronResult {
+  readonly stdout: string
+  readonly stderr: string
+  readonly code: number
+}
+
+/** 运行 crontab 命令；写模式必须显式 end stdin（否则 crontab 会阻塞等 EOF）。 */
+function runCrontab(args: readonly string[], input?: string): Promise<CronResult> {
+  return new Promise((resolve, reject) => {
+    const child = spawn('crontab', args, { stdio: ['pipe', 'pipe', 'pipe'] })
+    let stdout = ''
+    let stderr = ''
+    child.stdout.on('data', (chunk: Buffer) => { stdout += chunk.toString() })
+    child.stderr.on('data', (chunk: Buffer) => { stderr += chunk.toString() })
+    child.on('error', reject)
+    child.on('close', (code) => resolve({ stdout, stderr, code: code ?? -1 }))
+    child.stdin.end(input ?? '')
+  })
+}
+
 async function readCrontab(): Promise<string[]> {
   try {
-    const { stdout } = await execFileAsync('crontab', ['-l'], { encoding: 'utf8' })
-    return stdout.split('\n')
+    const result = await runCrontab(['-l'])
+    if (result.code === 0) return result.stdout.split('\n')
+    return []
   } catch {
     // 无 crontab 或读取失败：按空处理
     return []
@@ -134,11 +135,10 @@ async function readCrontab(): Promise<string[]> {
 }
 
 async function writeCrontab(lines: readonly string[]): Promise<void> {
-  const { stderr } = await execFileAsync('crontab', ['-'], {
-    encoding: 'utf8',
-    input: `${lines.join('\n')}\n`,
-  } as unknown as { encoding: 'utf8'; input: string })
-  if (stderr.trim() !== '') throw new Error(`crontab 写入失败: ${stderr.trim()}`)
+  const result = await runCrontab(['-'], `${lines.join('\n')}\n`)
+  if (result.code !== 0) {
+    throw new Error(`crontab 写入失败: ${result.stderr.trim() || `exit ${result.code}`}`)
+  }
 }
 
 function stripManagedBlock(lines: readonly string[]): string[] {
@@ -161,7 +161,7 @@ export async function generateWrapperFiles(
 ): Promise<Map<string, DeployResult>> {
   const { paths } = opts
   const results = new Map<string, DeployResult>()
-  const dsh = resolveDshCommand(opts.dshCommand)
+  const dsh = resolveDshCommand(opts.dshCommand, paths)
   const active = definitions.filter(definition => definition.status === 'active')
   const inactive = definitions.filter(definition => definition.status !== 'active')
 
@@ -197,7 +197,29 @@ export async function generateWrapperFiles(
     await rm(join(paths.tasks, `${definition.id}.txt`), { force: true }).catch(() => undefined)
     results.set(definition.id, { deployedAt: null, error: null })
   }
+  // 清理孤儿文件：wrapper/task 目录里不属于任何现有定义的文件（删除规则后残留）。
+  await pruneOrphans(paths, new Set(definitions.map(definition => definition.id)))
   return results
+}
+
+async function pruneOrphans(paths: PluginPaths, known: ReadonlySet<string>): Promise<void> {
+  for (const dir of [paths.wrappers, paths.tasks]) {
+    let entries: string[]
+    try {
+      entries = await readdir(dir)
+    } catch {
+      continue
+    }
+    for (const entry of entries) {
+      const id = entry.endsWith('.sh')
+        ? entry.slice(0, -3)
+        : entry.endsWith('.txt')
+          ? entry.slice(0, -4)
+          : undefined
+      if (id === undefined || known.has(id)) continue
+      await rm(join(dir, entry), { force: true }).catch(() => undefined)
+    }
+  }
 }
 
 /**
@@ -230,8 +252,11 @@ export async function syncDeployments(
       ? []
       : [CRONTAB_MARKER_START, ...entries, CRONTAB_MARKER_END]
     const next = stripManagedBlock(existing).concat(block)
-    const isEmptyNoop = block.length === 0 && next.every(line => line.trim() === '')
-    if (!isEmptyNoop) {
+    // 仅当"原内容或目标内容有实质行"时才写入：避免空 crontab 上无意义地建文件，
+    // 同时保证删除最后一条规则时能真正清掉遗留块。
+    const originalHasContent = existing.some(line => line.trim() !== '')
+    const nextHasContent = next.some(line => line.trim() !== '')
+    if (originalHasContent || nextHasContent) {
       await writeCrontab(next)
     }
   } catch (error) {
@@ -249,7 +274,11 @@ export async function syncDeployments(
   return results
 }
 
-/** 手动触发一条规则：以指定 trigger 启动其 wrapper。 */
+/**
+ * 手动触发一条规则：以指定 trigger 启动其 wrapper。
+ * 只等待 wrapper 吐出的第一行 runId 即返回，**不等待进程结束、不设超时**
+ * （wrapper 内部执行 headless 长任务，可能运行数分钟；终止它会把运行打断）。
+ */
 export function spawnWrapper(
   paths: PluginPaths,
   definitionId: string,
@@ -257,21 +286,32 @@ export function spawnWrapper(
 ): Promise<{ readonly runId: string | null; readonly error: string | null }> {
   const wrapper = join(paths.wrappers, `${definitionId}.sh`)
   return new Promise((resolve) => {
-    const child = execFile(
-      '/bin/bash',
-      [wrapper, trigger],
-      { encoding: 'utf8', timeout: 30_000 },
-      (error, stdout) => {
-        if (error !== null) {
-          resolve({ runId: null, error: error instanceof Error ? error.message : String(error) })
-          return
-        }
-        const first = stdout.split('\n').find(line => line.trim() !== '')
-        resolve({ runId: first?.trim() ?? null, error: null })
-      },
-    )
-    child.on('error', (error) => {
-      resolve({ runId: null, error: error.message })
+    let settled = false
+    const finish = (value: { readonly runId: string | null; readonly error: string | null }): void => {
+      if (!settled) {
+        settled = true
+        resolve(value)
+      }
+    }
+    let child
+    try {
+      child = spawn('/bin/bash', [wrapper, trigger], { stdio: ['ignore', 'pipe', 'inherit'] })
+    } catch (error) {
+      finish({ runId: null, error: error instanceof Error ? error.message : String(error) })
+      return
+    }
+    let stdout = ''
+    child.stdout.on('data', (chunk: Buffer) => {
+      stdout += chunk.toString()
+      const line = stdout.split('\n').find(value => value.trim() !== '')
+      if (line !== undefined) finish({ runId: line.trim(), error: null })
+    })
+    child.on('error', (error) => finish({ runId: null, error: error.message }))
+    child.on('exit', (code) => {
+      // 未在 stdout 收到 runId 就退出（wrapper 启动即失败）时才报错。
+      if (!settled) {
+        finish({ runId: null, error: code === null ? 'wrapper 启动失败' : `wrapper 退出码 ${String(code)}` })
+      }
     })
   })
 }
