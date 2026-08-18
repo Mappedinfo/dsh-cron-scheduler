@@ -1,0 +1,12 @@
+# dsh-cron-scheduler host row. One insert mounts the whole plugin:
+# definition CRUD + crontab deployment + run-now + session watcher + tools.
+- insert:
+    - id: cron-scheduler
+      name: '@mappedinfo/dsh-cron-scheduler'
+      config:
+        # headless profile the wrapper scripts boot (`dsh --profile <name> "<task>"`).
+        profile: headless
+        # Watcher poll interval for discovering headless-created sessions (seconds).
+        pollSeconds: 10
+        # Keep at most this many recent run records per rule.
+        historyLimit: 100
