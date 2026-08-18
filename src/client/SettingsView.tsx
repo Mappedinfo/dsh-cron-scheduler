@@ -113,6 +113,7 @@ export function SettingsView(props: {
     config: t('dsh.source.config'),
     env: t('dsh.source.env'),
     path: t('dsh.source.path'),
+    'auto-shim': t('dsh.source.auto-shim'),
     fallback: t('dsh.source.fallback'),
   }[snapshot.dsh.source] ?? ''
 
@@ -126,7 +127,7 @@ export function SettingsView(props: {
       {notice !== null && <div style={style.notice}>{notice}</div>}
       {snapshot !== undefined && (
         <>
-          <div style={style.muted}>{t('dsh.cmd')}：<span style={style.mono}>{snapshot.dsh.command}</span>（{dshSourceLabel}）</div>
+          <div style={style.muted}>{t('dsh.cmd')}：<span style={style.mono}>{snapshot.dsh.command}</span>{dshSourceLabel === '' ? '' : `（${dshSourceLabel}）`}</div>
           {definitions.length === 0 ? (
             <div style={style.empty}>{t('empty')}</div>
           ) : (
