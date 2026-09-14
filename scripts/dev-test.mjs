@@ -2,6 +2,7 @@
  * 开发自测：cron 校验 + wrapper 全链路（含 manifest 生命周期）。
  * 不触碰真实 crontab（只调用 generateWrapperFiles，不调 syncDeployments）。
  */
+import { existsSync } from 'node:fs'
 import { mkdtemp, readFile, writeFile, chmod, mkdir, readdir } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -224,6 +225,24 @@ process.env.PATH = savedPath
 if (savedBin === undefined) delete process.env.DSH_BIN
 else process.env.DSH_BIN = savedBin
 
+
+// ---- 依赖声明完整性：host bundle 的每个 @deepseek-ai 值导入都必须声明为 peer ----
+console.log('== peer 声明完整性 ==')
+{
+  const { readFileSync } = await import('node:fs')
+  const bundle = readFileSync(new URL('../lib/index.js', import.meta.url), 'utf8')
+  const declared = new Set(Object.keys(JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).peerDependencies ?? {}))
+  const imported = new Set()
+  for (const m of bundle.matchAll(/from\s+"(@deepseek-ai\/[^"]+)"/g)) imported.add(m[1])
+  console.log('  bundle 导入:', [...imported].join(', ') || '(无)')
+  const missing = [...imported].filter(name => !declared.has(name))
+  check('host bundle 的 @deepseek-ai 导入均已声明为 peer', missing.length === 0, missing.join(', '))
+  const missingFiles = [...declared].filter(name => {
+    if (name === '@deepseek-ai/cordis') return false
+    return !existsSync(new URL(`../node_modules/${name}/package.json`, import.meta.url))
+  })
+  check('已声明的 peer 均已安装（link 安装下可解析）', missingFiles.length === 0, missingFiles.join(', '))
+}
 
 console.log(failures === 0 ? '\n全部通过' : `\n${failures} 项失败`)
 process.exit(failures === 0 ? 0 : 1)

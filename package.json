@@ -1,7 +1,7 @@
 {
   "name": "@mappedinfo/dsh-cron-scheduler",
   "description": "DSH 定时任务插件：规则存为 Cron 表达式，由系统 cron（用户 crontab）在进程外执行 headless 任务，Web 端负责规则管理、部署与结果归类。",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "license": "MIT",
   "type": "module",
   "main": "./lib/index.js",
@@ -55,6 +55,7 @@
     "@deepseek-ai/dsh-client-runtime": ">=0.1.0-rc.5 <0.2.0",
     "@deepseek-ai/dsh-client-ui-conversation": ">=0.1.0-rc.5 <0.2.0",
     "@deepseek-ai/dsh-client-ui-settings": ">=0.1.0-rc.5 <0.2.0",
+    "@deepseek-ai/dsh-session": ">=0.1.0-rc.5 <0.2.0",
     "@deepseek-ai/dsh-tools": ">=0.1.0-rc.5 <0.2.0",
     "@deepseek-ai/dsh-workspace": ">=0.1.0-rc.5 <0.2.0"
   },
