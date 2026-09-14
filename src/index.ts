@@ -1,5 +1,6 @@
 /** dsh-cron-scheduler Host 插件入口：定义管理、crontab 部署、run-now、会话监听。 */
 
+import { appendFileSync } from 'node:fs'
 import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-client-connection'
 import { CronSchedulerService, type ServiceConfig } from './service.ts'
@@ -8,9 +9,24 @@ import { registerAutomationTools } from './tools.ts'
 import { SessionWatcher } from './watcher.ts'
 import { AUTOMATION_PROMPT_NAME, AUTOMATION_PROMPT_ORDER, AUTOMATION_PROMPT_TEXT } from './prompt.ts'
 
+
+/** 把插件运行期失败写入数据目录，便于排障（DSH 宿主日志不易获取）。 */
+function logFailure(phase: string, error: unknown): void {
+  try {
+    const detail = error instanceof Error ? (error.stack ?? error.message) : String(error)
+    appendFileSync(
+      process.env.DSH_CRON_FAILURE_LOG ?? '/tmp/dsh-cron-scheduler-failure.log',
+      `${new Date().toISOString()} [${phase}] ${detail}\n`,
+    )
+  } catch { /* 忽略 */ }
+}
+
 export const name = 'dsh-cron-scheduler'
 export const inject = [
-  'timer', 'agents', 'sessions', 'workspaceRegistry', 'tools', 'connection',
+  // webServer 必需：0.1.5 起 connection.rpc.handle() 内部通过 owner.webServer 注册路由，
+  // cordis 要求声明 inject 才能访问该服务，否则 apply 会抛
+  // 'cannot get property "webServer" without inject' 并回滚整个 effect。
+  'timer', 'agents', 'sessions', 'workspaceRegistry', 'tools', 'connection', 'webServer',
 ]
 
 export interface Config {
@@ -75,7 +91,8 @@ export function apply(ctx: Context, rawConfig: Config): void {
         )
         agentTools.set(agent, dispose)
       }
-      for (const agent of ctx.agents.roots()) mountTools(agent)
+      const roots = ctx.agents.roots()
+      for (const agent of roots) mountTools(agent)
       stopCreated = ctx.on('agent/created', ({ agent }: any) => { mountTools(agent) })
       stopDisposed = ctx.on('agent/disposed', ({ agent }: any) => { agentTools.delete(agent) })
 
@@ -96,6 +113,7 @@ export function apply(ctx: Context, rawConfig: Config): void {
         try {
           await service.start()
         } catch (error: unknown) {
+          logFailure('start', error)
           ctx.logger.warn(`dsh-cron-scheduler: initial deploy failed: ${error instanceof Error ? error.message : String(error)}`)
         }
         if (!alive) return
@@ -115,6 +133,8 @@ export function apply(ctx: Context, rawConfig: Config): void {
 
       return cleanup
     } catch (error) {
+      logFailure('apply', error)
+      ctx.logger.warn(`dsh-cron-scheduler: apply failed: ${error instanceof Error ? error.message : String(error)}`)
       await cleanup()
       throw error
     }

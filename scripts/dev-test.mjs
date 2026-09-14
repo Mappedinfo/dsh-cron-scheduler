@@ -167,9 +167,11 @@ try {
   if (savedDshHome === undefined) delete process.env.DSH_HOME
   else process.env.DSH_HOME = savedDshHome
 }
-check('crontab 已还原为空', (await new Promise(resolve => {
-  execFile('crontab', ['-l'], (err, stdout) => resolve(err === null && stdout.trim() === ''))
-})))
+// 用户既有部署（task-56c21114）不得被测试实例破坏（跨实例隔离）
+const existingCrontab = await new Promise(resolve => {
+  execFile('crontab', ['-l'], (err, stdout) => resolve(err === null ? stdout : ''))
+})
+check('用户既有 crontab 规则未被破坏', existingCrontab.includes('task-56c21114') || existingCrontab.trim() === '', existingCrontab.slice(0, 120))
 
 
 
@@ -244,5 +246,42 @@ console.log('== peer 声明完整性 ==')
   check('已声明的 peer 均已安装（link 安装下可解析）', missingFiles.length === 0, missingFiles.join(', '))
 }
 
+// ---- 0.1.5 兼容性回归：不得调用已损坏的 connection.rpc.handle；必须注入 webServer ----
+console.log('== 0.1.5 兼容性 ==')
+{
+  const { readFileSync } = await import('node:fs')
+  const bundle = readFileSync(new URL('../lib/index.js', import.meta.url), 'utf8')
+  const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'))
+  const codeOnly = bundle.split('\n').filter(l => !l.trim().startsWith('//') && !l.trim().startsWith('*') && !l.trim().startsWith('/*')).join('\n')
+  check('未调用 connection.rpc.handle（0.1.5 该 API 已损坏）', !codeOnly.includes('.rpc.handle(') && !codeOnly.includes('rpc].handle'))
+  check('inject 声明 webServer', (pkg.dsh?.profile === undefined) && readFileSync(new URL('../src/index.ts', import.meta.url), 'utf8').includes("'webServer'"))
+  check('自带 RPC 路由（webServer.register + server-response 信封）', bundle.includes('webServer.register') && bundle.includes('server-response'))
+}
+
+
+// ---- 托管块隔离：不同 DSH home 的块互不清理 ----
+console.log('== 托管块隔离 ==')
+{
+  const { crontabMarkers, stripManagedBlock } = await import('../lib/test-entry.js')
+  const mine = crontabMarkers('/home/me/.dsh/cron-scheduler')
+  const other = crontabMarkers('/home/other/.dsh/cron-scheduler')
+  const lines = [
+    'MAILTO=""',
+    other.start,
+    `0 1 * * * /bin/bash /home/other/.dsh/cron-scheduler/wrappers/task-x.sh`,
+    other.end,
+    mine.start,
+    `0 21 * * * /bin/bash /home/me/.dsh/cron-scheduler/wrappers/task-y.sh`,
+    mine.end,
+  ]
+  const stripped = stripManagedBlock(lines, '/home/me/.dsh/cron-scheduler')
+  check('移除本实例块', !stripped.some(l => l.includes('task-y.sh')))
+  check('保留其他实例块', stripped.some(l => l.includes('task-x.sh')) && stripped.some(l => l === other.start))
+  // 旧版无标记块：内容引用本实例 base → 视为己有
+  const legacyOwn = ['# >>> dsh-cron-scheduler managed block >>>', '0 9 * * * /bin/bash /home/me/.dsh/cron-scheduler/wrappers/task-z.sh', '# <<< dsh-cron-scheduler managed block <<<']
+  check('迁移：旧无标记块（本实例）被清理', stripManagedBlock(legacyOwn, '/home/me/.dsh/cron-scheduler').every(l => l.trim() === ''))
+  const legacyForeign = ['# >>> dsh-cron-scheduler managed block >>>', '0 9 * * * /bin/bash /home/other/.dsh/cron-scheduler/wrappers/task-w.sh', '# <<< dsh-cron-scheduler managed block <<<']
+  check('旧无标记块（他人）被保留', stripManagedBlock(legacyForeign, '/home/me/.dsh/cron-scheduler').some(l => l.includes('task-w.sh')))
+}
 console.log(failures === 0 ? '\n全部通过' : `\n${failures} 项失败`)
 process.exit(failures === 0 ? 0 : 1)

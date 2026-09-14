@@ -109,28 +109,59 @@ interface CronResult {
   readonly code: number
 }
 
-/** 运行 crontab 命令；写模式必须显式 end stdin（否则 crontab 会阻塞等 EOF）。 */
+/** crontab 命令超时（毫秒）：任何情况下都不得阻塞 web 进程。 */
+const CRONTAB_TIMEOUT_MS = 15_000
+
+/**
+ * 运行 crontab 命令。
+ * 写模式必须显式 end stdin（否则 crontab 会阻塞等 EOF）；
+ * 另外加硬超时并杀掉子进程——系统 crontab 可能因陈旧锁而永久挂起，
+ * 此时必须快速失败并把错误暴露到设置页，而不是拖住整个 web 进程。
+ */
 function runCrontab(args: readonly string[], input?: string): Promise<CronResult> {
   return new Promise((resolve, reject) => {
     const child = spawn('crontab', args, { stdio: ['pipe', 'pipe', 'pipe'] })
     let stdout = ''
     let stderr = ''
+    let settled = false
+    const finish = (result: CronResult): void => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      resolve(result)
+    }
+    const timer = setTimeout(() => {
+      try { child.kill('SIGKILL') } catch { /* 忽略 */ }
+      finish({
+        stdout,
+        stderr: `${stderr}${stderr === '' ? '' : '\n'}crontab 超时（${CRONTAB_TIMEOUT_MS}ms）：系统 crontab 可能被陈旧锁占用`,
+        code: -2,
+      })
+    }, CRONTAB_TIMEOUT_MS)
     child.stdout.on('data', (chunk: Buffer) => { stdout += chunk.toString() })
     child.stderr.on('data', (chunk: Buffer) => { stderr += chunk.toString() })
-    child.on('error', reject)
-    child.on('close', (code) => resolve({ stdout, stderr, code: code ?? -1 }))
+    child.on('error', (error) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      reject(error)
+    })
+    child.on('close', (code) => finish({ stdout, stderr, code: code ?? -1 }))
     child.stdin.end(input ?? '')
   })
 }
 
-async function readCrontab(): Promise<string[]> {
+type CrontabRead = { readonly ok: true; readonly lines: string[] } | { readonly ok: false; readonly error: string }
+
+async function readCrontab(): Promise<CrontabRead> {
   try {
     const result = await runCrontab(['-l'])
-    if (result.code === 0) return result.stdout.split('\n')
-    return []
-  } catch {
-    // 无 crontab 或读取失败：按空处理
-    return []
+    if (result.code === 0) return { ok: true, lines: result.stdout.split('\n') }
+    // 退出码 1 = 该用户没有 crontab（合法空状态）；其余（含超时 -2）视为读取失败
+    if (result.code === 1) return { ok: true, lines: [] }
+    return { ok: false, error: result.stderr.trim() || `crontab -l 退出码 ${result.code}` }
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) }
   }
 }
 
@@ -141,15 +172,51 @@ async function writeCrontab(lines: readonly string[]): Promise<void> {
   }
 }
 
-function stripManagedBlock(lines: readonly string[]): string[] {
-  const kept: string[] = []
-  let inside = false
-  for (const line of lines) {
-    if (line.trim() === CRONTAB_MARKER_START) { inside = true; continue }
-    if (line.trim() === CRONTAB_MARKER_END) { inside = false; continue }
-    if (!inside) kept.push(line)
+/**
+ * 本实例的托管块标记：带上 DSH home，避免多个 DSH 实例（不同 DSH_HOME）互相清理
+ * 对方部署的 crontab 条目。
+ */
+export function crontabMarkers(base: string): { readonly start: string; readonly end: string } {
+  return {
+    start: `# >>> dsh-cron-scheduler managed block: ${base} >>>`,
+    end: `# <<< dsh-cron-scheduler managed block: ${base} <<<`,
   }
-  return kept.filter((line, index, all) => !(line.trim() === '' && (index === 0 || all[index - 1]?.trim() === '')))
+}
+
+/**
+ * 移除本实例的托管块（旧版无标记块仅在内容引用本实例 base 时视为己有）。
+ * 其他实例的块原样保留。
+ */
+export function stripManagedBlock(lines: readonly string[], base: string): string[] {
+  const { start, end } = crontabMarkers(base)
+  const kept: string[] = []
+  let index = 0
+  while (index < lines.length) {
+    const line = lines[index] ?? ''
+    const trimmed = line.trim()
+    if (trimmed === start) {
+      index += 1
+      while (index < lines.length && (lines[index] ?? '').trim() !== end) index += 1
+      index += 1
+      continue
+    }
+    if (trimmed === CRONTAB_MARKER_START) {
+      const body: string[] = []
+      let scan = index + 1
+      while (scan < lines.length && (lines[scan] ?? '').trim() !== CRONTAB_MARKER_END) {
+        body.push(lines[scan] ?? '')
+        scan += 1
+      }
+      const owned = body.filter(item => item.trim() !== '').every(item => item.includes(base))
+      if (owned) {
+        index = scan + 1
+        continue
+      }
+    }
+    kept.push(line)
+    index += 1
+  }
+  return kept.filter((line, position, all) => !(line.trim() === '' && (position === 0 || all[position - 1]?.trim() === '')))
 }
 
 /**
@@ -238,7 +305,12 @@ export async function syncDeployments(
   // crontab 同步
   let crontabError: string | null = null
   try {
-    const existing = await readCrontab()
+    const read = await readCrontab()
+    if (!read.ok) {
+      // 读取失败时绝不写入：避免把用户的 crontab 覆盖成只剩本插件块
+      throw new Error(`crontab 读取失败，已跳过部署：${read.error}`)
+    }
+    const existing = read.lines
     const entries = active
       .sort((a, b) => a.id.localeCompare(b.id))
       .map(definition => {
@@ -248,10 +320,11 @@ export async function syncDeployments(
         const cronPart = cron === '@reboot' ? '@reboot' : cron
         return `${cronPart} /bin/bash ${wrapper} >> ${log} 2>&1`
       })
+    const markers = crontabMarkers(paths.base)
     const block = entries.length === 0
       ? []
-      : [CRONTAB_MARKER_START, ...entries, CRONTAB_MARKER_END]
-    const next = stripManagedBlock(existing).concat(block)
+      : [markers.start, ...entries, markers.end]
+    const next = stripManagedBlock(existing, paths.base).concat(block)
     // 仅当"原内容或目标内容有实质行"时才写入：避免空 crontab 上无意义地建文件，
     // 同时保证删除最后一条规则时能真正清掉遗留块。
     const originalHasContent = existing.some(line => line.trim() !== '')

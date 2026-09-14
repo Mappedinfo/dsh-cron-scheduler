@@ -8,6 +8,7 @@ declare module '@deepseek-ai/cordis' {
     readonly sessionPersistence?: any
     readonly workspaceRegistry: any
     readonly connection: any
+    readonly webServer: { register(route: unknown): () => void }
     readonly tools: any
     readonly systemPrompt?: { section(input: { name: string; order: number; text: string }): () => void }
     readonly logger: { warn(message: string): void }

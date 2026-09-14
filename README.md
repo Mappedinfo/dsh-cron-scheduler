@@ -128,3 +128,20 @@ node scripts/dev-test.mjs   # cron 校验 + wrapper 全链路自测（不碰真�
 ## License
 
 MIT
+
+## 兼容性
+
+| DSH 版本 | 状态 |
+|---|---|
+| ≥ 0.1.5 | ✅ 支持（当前） |
+| 0.1.0-rc.x | ⚠️ 不支持：0.1.5 起 `connection.rpc.handle()` 内部改为通过 `owner.webServer` 注册路由，该方法在 0.1.5 对插件调用方不可用；本插件改为**自行在 webServer 注册 RPC 路由**并实现官方信封，因此需要具备 `webServer` 服务的 0.1.5+ |
+
+## 故障排查
+
+- **设置页显示"部署失败"**：查看规则行的 `deployError`；插件也会把 apply/部署失败写入 `/tmp/dsh-cron-scheduler-failure.log`（可用环境变量 `DSH_CRON_FAILURE_LOG` 改路径）。
+- **crontab 命令超时（"crontab 超时…可能被陈旧锁占用"）**：系统 crontab 被中断的写入留下了陈旧锁（`/var/at/tabs`，root 700）。写入会快速失败并报错，不会卡住 DSH Web；恢复需清理锁或重启：
+  ```sh
+  sudo ls -la /var/at/tabs/          # 查看残留
+  sudo rm -rf /var/at/tabs/<残留项>   # 或直接重启机器
+  ```
+- **多实例安全**：托管块标记带 DSH home（`# >>> dsh-cron-scheduler managed block: <base> >>>`），不同 `DSH_HOME` 的实例互不清理对方条目；读取失败时绝不写入，避免覆盖用户 crontab。

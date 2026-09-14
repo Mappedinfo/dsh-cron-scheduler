@@ -2,5 +2,6 @@
 export { validateCron, nextCronRun, normalizeCron, CRON_PRESETS } from './cron.ts'
 export { generateWrapperFiles, wrapperScript, syncDeployments, CRONTAB_MARKER_START, CRONTAB_MARKER_END } from './deploy.ts'
 export { deriveCliEntryFromArgv, ensureDshShim, resolveDshCommand } from './dsh-resolve.ts'
+export { crontabMarkers, stripManagedBlock } from './deploy.ts'
 export { CronSchedulerService } from './service.ts'
 export { spawnWrapper } from './deploy.ts'
